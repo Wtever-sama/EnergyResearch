@@ -144,7 +144,7 @@ def main():
         
         # 保存 V1, V2
         out_v2 = os.path.join(output_dir, f"wind_{scn}_V2_delta_x_2040-2060.nc")
-        out_v1 = os.path.join(output_dir, f"wind_{scn}_V1_is_extreme_2040-2060.nc")
+        out_v1 = os.path.join(output_dir, f"wind_{scn}_V1_extreme_flag_2040-2060.nc")
         
         logging.info(f"保存: V2 -> {out_v2}")
         try:

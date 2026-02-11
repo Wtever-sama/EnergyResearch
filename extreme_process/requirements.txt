@@ -1,0 +1,8 @@
+# python 3.12
+regionmask
+geopandas
+xarray
+cartopy
+tqdm
+numpy
+matplotlib

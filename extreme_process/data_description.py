@@ -195,7 +195,7 @@ def inspect_nc_file(file_path, log_dir="logs"):
 
 if __name__ == "__main__":
     # data_name = r"G:\extreme_analysis\data\CMIP6_QDM_MME\*.nc"
-    data_name = r"G:\extreme_analysis\results\solar\*.nc"
+    data_name = r"G:\extreme_analysis\data\CMIP6_QDM_MME\*.nc"
     files = glob.glob(pathname=data_name)
     for f in files:
         inspect_nc_file(f)
