@@ -193,9 +193,156 @@ def inspect_nc_file(file_path, log_dir="logs"):
         print(f"读取文件时出错: {e}")
 
 
+def inspect_npy_file(file_path, log_dir="logs"):
+    '''
+    读取NPY文件并做数据描述性统计
+    '''
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
+    file_name = os.path.basename(file_path)
+    file_name_no_ext = os.path.splitext(file_name)[0]
+    log_file = os.path.join(log_dir, f"{file_name_no_ext}_data_description.txt")
+
+    try:
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        with open(log_file, 'w', encoding='utf-8') as f:
+            f.write(f"--- NPY/NPZ 文件描述报告 ---\n")
+            f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"文件名: {file_name}\n")
+            f.write(f"文件路径: {file_path}\n")
+            f.write(f"文件大小: {_format_bytes(file_size)} ({file_size} bytes)\n")
+            f.write('-' * 30 + "\n\n")
+
+            # 区分 npy 与 npz
+            if file_path.lower().endswith('.npz'):
+                f.write('[Archive: .npz]\n')
+                try:
+                    archive = np.load(file_path, mmap_mode='r')
+                    keys = archive.files
+                    f.write(f" 包含数组键: {keys}\n\n")
+                except Exception as e:
+                    f.write(f" 无法读取 npz 存档: {e}\n")
+                    print(f"读取文件时出错: {e}")
+                    return
+
+                for key in keys:
+                    arr = archive[key]
+                    f.write(f" > 数组: {key}\n")
+                    f.write(f"   - shape: {getattr(arr, 'shape', '未知')}\n")
+                    f.write(f"   - dtype: {getattr(arr, 'dtype', '未知')}\n")
+
+                    # 统计摘要
+                    v_mean = _safe_reduce(arr, 'mean')
+                    v_min = _safe_reduce(arr, 'min')
+                    v_max = _safe_reduce(arr, 'max')
+                    v_std = _safe_reduce(arr, 'std')
+                    try:
+                        flat = arr.ravel()
+                        # 尽量用小样本计算中位数，避免全量排序
+                        sample_for_median = flat[:1000]
+                        v_median = np.median(sample_for_median) if sample_for_median.size > 0 else None
+                    except Exception:
+                        v_median = None
+
+                    if v_mean is not None:
+                        f.write(f"   - mean: {v_mean}\n")
+                    if v_min is not None and v_max is not None:
+                        f.write(f"   - range: {v_min} to {v_max}\n")
+                    if v_median is not None:
+                        f.write(f"   - median(sample): {v_median}\n")
+                    if v_std is not None:
+                        f.write(f"   - std: {v_std}\n")
+
+                    # 缺失值统计（仅浮点数有效）
+                    try:
+                        if np.issubdtype(arr.dtype, np.floating):
+                            n_missing = int(np.count_nonzero(np.isnan(arr)))
+                        else:
+                            n_missing = 0
+                        f.write(f"   - total elements: {arr.size}; missing (NaN): {n_missing}\n")
+                    except Exception:
+                        pass
+
+                    # 前/尾样本
+                    try:
+                        flat = arr.ravel()
+                        n = flat.size
+                        first_n = flat[:10].tolist() if n > 0 else []
+                        last_n = flat[-10:].tolist() if n > 0 else []
+                        f.write(f"   - first{min(10,n)} sample: {first_n}\n")
+                        f.write(f"   - last{min(10,n)} sample: {last_n}\n")
+                    except Exception:
+                        f.write("   - 无法读取样本值\n")
+
+                    f.write('\n')
+
+                try:
+                    archive.close()
+                except Exception:
+                    pass
+
+            else:
+                # 单个 .npy 数组
+                try:
+                    arr = np.load(file_path, mmap_mode='r')
+                except Exception as e:
+                    f.write(f"无法读取 NPY 文件: {e}\n")
+                    print(f"读取文件时出错: {e}")
+                    return
+
+                f.write('[Array: .npy]\n')
+                f.write(f" - shape: {getattr(arr, 'shape', '未知')}\n")
+                f.write(f" - dtype: {getattr(arr, 'dtype', '未知')}\n")
+
+                v_mean = _safe_reduce(arr, 'mean')
+                v_min = _safe_reduce(arr, 'min')
+                v_max = _safe_reduce(arr, 'max')
+                v_std = _safe_reduce(arr, 'std')
+                try:
+                    flat = arr.ravel()
+                    sample_for_median = flat[:1000]
+                    v_median = np.median(sample_for_median) if sample_for_median.size > 0 else None
+                except Exception:
+                    v_median = None
+
+                if v_mean is not None:
+                    f.write(f" - mean: {v_mean}\n")
+                if v_min is not None and v_max is not None:
+                    f.write(f" - range: {v_min} to {v_max}\n")
+                if v_median is not None:
+                    f.write(f" - median(sample): {v_median}\n")
+                if v_std is not None:
+                    f.write(f" - std: {v_std}\n")
+
+                try:
+                    if np.issubdtype(arr.dtype, np.floating):
+                        n_missing = int(np.count_nonzero(np.isnan(arr)))
+                    else:
+                        n_missing = 0
+                    f.write(f" - total elements: {arr.size}; missing (NaN): {n_missing}\n")
+                except Exception:
+                    pass
+
+                try:
+                    n = arr.ravel().size
+                    first_n = arr.ravel()[:10].tolist() if n > 0 else []
+                    last_n = arr.ravel()[-10:].tolist() if n > 0 else []
+                    f.write(f" - first{min(10,n)} sample: {first_n}\n")
+                    f.write(f" - last{min(10,n)} sample: {last_n}\n")
+                except Exception:
+                    f.write(" - 无法读取样本值\n")
+
+        print(f"成功完成! 描述文件已保存至: {log_file}")
+
+    except Exception as e:
+        print(f"读取文件时出错: {e}")
+
+
 if __name__ == "__main__":
     # data_name = r"G:\extreme_analysis\data\CMIP6_QDM_MME\*.nc"
-    data_name = r"G:\extreme_analysis\data\CMIP6_QDM_MME\*.nc"
+    data_name = r"F:\code_program\EnergyResearch\extreme_process\STICC\STICC-master\output_folder\*.npy"
     files = glob.glob(pathname=data_name)
     for f in files:
-        inspect_nc_file(f)
+        # inspect_nc_file(f)
+        inspect_npy_file(f)

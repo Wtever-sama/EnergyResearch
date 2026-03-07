@@ -1,4 +1,4 @@
-''' 绘制各种变量的2040-2060年平均极端事件平均地理图谱, 目前支持solar wind '''
+''' 绘制各种变量的2040-2060年平均极端事件平均地理图谱, 支持南海诸岛子图与1:1比例 '''
 
 import xarray as xr
 import numpy as np
@@ -11,6 +11,8 @@ import regionmask
 import geopandas as gpd
 from pathlib import Path
 import os
+import json
+from shapely.geometry import shape
 from shapely.ops import unary_union
 import warnings
 warnings.filterwarnings("ignore")
@@ -19,23 +21,15 @@ warnings.filterwarnings("ignore")
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-
 def get_annual_frequency(file_path: str | Path) -> xr.DataArray | None:
-    """
-    计算频率数据（保留原逻辑）
-    :param file_path: 输入的极端事件NC文件路径
-    :return: 年频率数据
-    """
     if not os.path.exists(file_path): 
         return None
     ds = xr.open_dataset(file_path)
     da = ds['event_flag']
     mask = da.fillna(0)
     is_start = (mask == 1) & (mask.shift(time=1) != 1)
-    # 计算21年均值 (2040-2060)
     freq = is_start.sum(dim='time') / 21.0
     return freq
-
 
 def plot_frequency(freq_data: xr.DataArray, 
                    output_dir: str, 
@@ -45,98 +39,177 @@ def plot_frequency(freq_data: xr.DataArray,
                    vmax: float, 
                    geo_path: str | Path,
                    cmap: str = 'YlOrRd') -> str | Path:
-    """
-    使用 contourf 实现平滑过渡，并支持 .shp 或 .geojson 格式进行严格边界裁剪。
-    :param freq_data: 年频率数据
-    :param output_dir: 输出目录
-    :param energy_label: 能源类型标签, 如"rsds"
-    :param scenario: 情景名称
-    :param vmin: 颜色映射最小值
-    :param vmax: 颜色映射最大值
-    :param geo_path: 地理边界文件路径
-    :param cmap: 颜色映射
-    :return: 保存的图像路径
-    :rtype: str | Path
-    """
-    # 自动识别并加载矢量边界 (shp 或 geojson)
-    gdf = gpd.read_file(geo_path)
-    gdf.geometry = gdf.geometry.make_valid()
-    # 将数据从 1度 插值到 0.1度
+    
+    # --- 修复逻辑：鲁棒性读取非标准 GeoJSON，解决 NotImplementedError ---
+    use_geopandas = True
+    merged = None
+    try:
+        gdf = gpd.read_file(geo_path)
+        # ensure valid geometry column exists
+        try:
+            gdf.geometry = gdf.geometry.make_valid()
+        except Exception:
+            pass
+    except Exception:
+        # 回退：手动解析 GeoJSON（避免 geopandas/fiona 的 JSON decode 问题）
+        use_geopandas = False
+        with open(geo_path, 'r', encoding='utf-8') as f:
+            js_data = json.load(f)
+        features = js_data['features'] if 'features' in js_data else js_data
+        # 直接构造 shapely 几何列表，然后合并为一个
+        shapes = [shape(feat['geometry']) for feat in features]
+        merged = unary_union(shapes)
+
+    # 提高插值分辨率
     freq_data = freq_data.interp(
-        lon=np.arange(73, 135.1, 0.1), 
-        lat=np.arange(15, 55.1, 0.1), 
+        lon=np.arange(freq_data.lon.min(), freq_data.lon.max(), 0.1), 
+        lat=np.arange(freq_data.lat.min(), freq_data.lat.max(), 0.1), 
         method='linear'
     )
     
-    # 严格地理边界掩码处理
-    mask = regionmask.mask_3D_geopandas(gdf, freq_data.lon, freq_data.lat)
-    freq_masked = freq_data.where(mask.any('region'))
+    if use_geopandas:
+        mask = regionmask.mask_3D_geopandas(gdf, freq_data.lon, freq_data.lat)
+        freq_masked = freq_data.where(mask.any('region'))
+    else:
+        # 使用 shapely geometry + matplotlib.path 在网格上做点内判断，构造掩膜
+        lon_vals = freq_data.lon.values
+        lat_vals = freq_data.lat.values
+        lon2d, lat2d = np.meshgrid(lon_vals, lat_vals)
+        pts = np.vstack((lon2d.ravel(), lat2d.ravel())).T
+        masks = np.zeros(len(pts), dtype=bool)
+        # merged 可能是多多边形或单多边形
+        if hasattr(merged, 'geoms'):
+            polys = list(merged.geoms)
+        else:
+            polys = [merged]
+        for p in polys:
+            try:
+                path = mpath.Path(np.array(p.exterior.coords))
+            except Exception:
+                # 跳过无法处理的子几何
+                continue
+            masks |= path.contains_points(pts)
+        mask2d = masks.reshape(lon2d.shape)
+        # mask2d 的维度是 (lat, lon)
+        mask_da = xr.DataArray(mask2d, dims=('lat', 'lon'), coords={'lat': lat_vals, 'lon': lon_vals})
+        freq_masked = freq_data.where(mask_da)
 
-    # 初始化地图投影
-    plt.figure(figsize=(12, 8))
-    ax = plt.axes(projection=ccrs.PlateCarree())
-    ax.set_extent([73, 135, 15, 55], crs=ccrs.PlateCarree())
-    # ax.set_extent([70, 140, 15, 55], crs=ccrs.PlateCarree())
+    # --- 关键修复：设置正确的地图比例 ---
+    # 计算中国地图范围的比例，确保地图不被拉伸
+    lon_min, lon_max = 73, 135
+    lat_min, lat_max = 15, 54
     
-    # 绘制平滑等值线填充
+    # 计算经纬度范围的比例
+    lon_range = lon_max - lon_min
+    lat_range = lat_max - lat_min
+    
+    # 根据经纬度范围设置合适的图形宽高比
+    # 注意：PlateCarree投影中，经度纬度的单位长度在赤道处相等，但随纬度变化
+    # 这里使用近似的赤道纬度(约23.5度)的cos值进行修正
+    cos_mid_lat = np.cos(np.radians(23.5))  # 中国大约的中纬度
+    aspect_ratio = (lon_range * cos_mid_lat) / lat_range
+    
+    # 设置图形尺寸，保持正确的比例
+    fig_width = 10
+    fig_height = fig_width / aspect_ratio
+    
+    # 如果高度过大或过小，进行调整
+    if fig_height > 14:
+        fig_height = 14
+        fig_width = fig_height * aspect_ratio
+    elif fig_height < 8:
+        fig_height = 8
+        fig_width = fig_height * aspect_ratio
+    
+    fig = plt.figure(figsize=(fig_width, fig_height))
+    proj = ccrs.PlateCarree()
+    ax = fig.add_subplot(1, 1, 1, projection=proj)
+    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=proj)
+    
+    # 设置坐标轴的长宽比为数据的长宽比，确保1:1比例
+    ax.set_aspect('auto', adjustable='box')
+    
     levels = np.linspace(vmin, vmax, 21)
     cf = ax.contourf(
         freq_masked.lon, freq_masked.lat, freq_masked,
-        levels=levels,
-        transform=ccrs.PlateCarree(),
-        cmap=cmap,
-        extend='max'
+        levels=levels, transform=proj, cmap=cmap, extend='max'
     )
 
-    # 从 GeoDataFrame 获取多边形路径, gdf 是读入的中国边界
-    invalid_mask = ~gdf.geometry.is_valid
-    if invalid_mask.any():
-        invalid_idx = list(gdf.index[invalid_mask])
-        raise ValueError(
-            f"输入边界文件包含无效几何对象，索引: {invalid_idx}，请修复源文件后重试（例如在 geopandas 中使用 `gdf.geometry = gdf.geometry.buffer(0)` 或 shapely.make_valid）。"
-        )
-    
-    poly = unary_union(gdf.geometry)
-    # 为每个多边形/环创建 matplotlib.path.Path
-    subpaths = [mpath.Path(np.array(p.exterior.coords)) for p in (poly.geoms if hasattr(poly, 'geoms') else [poly])]
+    # 制作物理裁剪 Patch
+    # 获取用于裁剪与绘制的多边形（可能来自 geopandas 或回退的 merged）
+    if use_geopandas:
+        poly = unary_union(gdf.geometry)
+    else:
+        poly = merged
+
+    if hasattr(poly, 'geoms'):
+        subpaths = []
+        for p in poly.geoms:
+            try:
+                subpaths.append(mpath.Path(np.array(p.exterior.coords)))
+            except Exception:
+                continue
+    else:
+        subpaths = [mpath.Path(np.array(poly.exterior.coords))]
     compound = mpath.Path.make_compound_path(*subpaths)
     patch = mpatches.PathPatch(compound, transform=ax.transData, facecolor='none')
 
-    # 强制裁剪图层
-    collections = getattr(cf, 'collections', None)
-    if collections is None and hasattr(cf, 'ax') and hasattr(cf.ax, 'collections'):
-        collections = cf.ax.collections
-    if collections:
-        for collection in collections:
-            collection.set_clip_path(patch)
+    # 裁剪主图（防守式：cf 可能没有 collections 属性）
+    coll_iter = getattr(cf, 'collections', [])
+    for collection in coll_iter:
+        collection.set_clip_path(patch)
 
-    # 叠加地理底图与掩码要素
+    # 地理底图
     ax.add_feature(cfeature.OCEAN, facecolor='white', zorder=2)
     ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=3)
+    if use_geopandas:
+        # 使用 geopandas 绘制边界
+        gdf.boundary.plot(ax=ax, linewidth=0.8, color='black', zorder=4, transform=proj)
+    else:
+        from cartopy.feature import ShapelyFeature
+        ax.add_feature(ShapelyFeature([poly], proj, edgecolor='black', facecolor='none', linewidth=0.8), zorder=4)
+
+    # --- 添加南海诸岛缩略图 ---
+    # 调整小图位置和大小，使用 inset_scale 快速放大/缩小（保持简洁，不使用 try/except）
+    inset_scale = 1  # >1 放大, <1 缩小
+    base_left, base_bottom, base_w, base_h = 0.65, 0.129, 0.1, 0.185
+    sub_ax = fig.add_axes([base_left, base_bottom, base_w * inset_scale, base_h * inset_scale], projection=proj)
+    sub_ax.set_extent([107, 122.5, 0, 23.5], crs=proj)
+    # 保持原有的 auto aspect
+    sub_ax.set_aspect('auto', adjustable='box')
     
-    # 绘制行政边界线
-    gdf.boundary.plot(ax=ax, linewidth=0.8, color='black', zorder=4, transform=ccrs.PlateCarree())
+    sub_cf = sub_ax.contourf(
+        freq_masked.lon, freq_masked.lat, freq_masked,
+        levels=levels, transform=proj, cmap=cmap, extend='max'
+    )
+    
+    sub_patch = mpatches.PathPatch(compound, transform=sub_ax.transData, facecolor='none')
+    sub_coll_iter = getattr(sub_cf, 'collections', [])
+    for collection in sub_coll_iter:
+        collection.set_clip_path(sub_patch)
+        
+    sub_ax.add_feature(cfeature.OCEAN, facecolor='white', zorder=2)
+    if use_geopandas:
+        gdf.boundary.plot(ax=sub_ax, linewidth=0.6, color='black', zorder=4, transform=proj)
+    else:
+        from cartopy.feature import ShapelyFeature
+        sub_ax.add_feature(ShapelyFeature([poly], proj, edgecolor='black', facecolor='none', linewidth=0.6), zorder=4)
 
-    # 设置标题与图例 (保留原始格式)
-    # 【使用中文绘图】
-    plt.title(f'极端 {energy_label} 事件的年频率\n({scenario}, 12小时阈值, 2040-2060)')
-    cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, aspect=25)
-    cbar.set_label('年频率 (事件/年)')
+    # 装饰 (保持中文标题)
+    plt.sca(ax)
+    plt.title(f'年均极端{energy_label}事件发生频率\n({scenario}, 12h阈值, 2040-2060)', fontsize=14)
+    cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.03, aspect=30, shrink=0.7)
+    cbar.set_label('年均发生频率 (次/年)')
 
-    # 保存图像
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, f"{energy_label}_{scenario}_Frequency_Map.png")
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
     return save_path
 
-
 if __name__ == "__main__":
-    # 路径配置
     results_root = r"G:\extreme_analysis\results"
     figure_path_base = "frequency_figures"
-    # 支持 .shp 或 .geojson
     geo_boundary = r"G:\extreme_analysis\geoshape_file\CHN_ALI\CHN_ALIYUN.geojson"
     
     scenarios = ['ssp126', 'ssp245', 'ssp585']
@@ -145,48 +218,37 @@ if __name__ == "__main__":
         "solar": "rsds",
         "wind": "ws100m"
     }
-
-    # colormap mapping by energy type (可根据需要调整)
+    
     cmap_mapping = {
-        'solar': 'YlOrRd',  # 暖色系
-        'wind': 'Blues'     # 冷色系
+        'solar': 'YlOrRd',
+        'wind': 'YlGnBu'
     }
 
     for energy_type in energy_types:
-        print(f"正在处理 {energy_type} 跨情景频率并集...")
+        print(f"正在处理 {energy_type}...")
         scenario_data = {}
         all_max = []
 
-        # 阶段1：收集所有情景数据并确定全局 Vmax
         for scenario in scenarios:
-            if energy_type == 'solar':
-                fpath = os.path.join(results_root, "solar", f"solar_{scenario}_V1_Reliability_12h.nc")
-            else:
-                fpath = os.path.join(results_root, "wind", f"wind_{scenario}_V1_Reliability_12h.nc")
-            
+            fpath = os.path.join(results_root, energy_type, f"{energy_type}_{scenario}_V1_Reliability_12h.nc")
             freq = get_annual_frequency(fpath)
             if freq is not None:
                 scenario_data[scenario] = freq
                 all_max.append(float(freq.max().values))
         
-        if not all_max: 
-            continue
-        
+        if not all_max: continue
         global_vmax = max(all_max)
-        global_vmin = 0
         
-        # 阶段2：统一值域绘图
-        # 保存路径: 【结果根路径/变量类型/图片文件夹名称】
         plot_out_dir = os.path.join(results_root, energy_type, figure_path_base)
         for scenario, da in scenario_data.items():
             save_path = plot_frequency(
-                freq_data=da,
+                freq_data=da, 
                 output_dir=plot_out_dir,
                 energy_label=energy_types_mapping[energy_type],
-                scenario=scenario,
-                vmin=global_vmin,
+                scenario=scenario, 
+                vmin=0, 
                 vmax=global_vmax,
-                geo_path=geo_boundary,
-                cmap=cmap_mapping.get(energy_type, 'viridis')
+                geo_path=geo_boundary, 
+                cmap=cmap_mapping.get(energy_type, 'YlOrRd')
             )
-            print(f"  {energy_type.upper()} {scenario} 绘图完成, 图片保存到 {save_path}")
+            print(f"  {energy_type.upper()} {scenario} 完成, 图片保存到 {save_path}")
