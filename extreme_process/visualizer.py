@@ -7,6 +7,7 @@ import matplotlib.patches as mpatches
 import matplotlib.path as mpath
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+from matplotlib.colors import LinearSegmentedColormap
 import regionmask
 import geopandas as gpd
 from pathlib import Path
@@ -21,15 +22,57 @@ warnings.filterwarnings("ignore")
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-def get_annual_frequency(file_path: str | Path) -> xr.DataArray | None:
-    if not os.path.exists(file_path): 
-        return None
+
+def add_north(ax, labelsize=14, loc_x=0.92, loc_y=0.88, width=0.03, height=0.08, pad=0.14):
+    """在地图轴上添加与 plot_main 一致风格的指北针。"""
+    minx, maxx = ax.get_xlim()
+    miny, maxy = ax.get_ylim()
+    ylen = maxy - miny
+    xlen = maxx - minx
+    left = [minx + xlen * (loc_x - width * 0.5), miny + ylen * (loc_y - pad)]
+    right = [minx + xlen * (loc_x + width * 0.5), miny + ylen * (loc_y - pad)]
+    top = [minx + xlen * loc_x, miny + ylen * (loc_y - pad + height)]
+    center = [minx + xlen * loc_x, left[1] + (top[1] - left[1]) * 0.4]
+    triangle = mpatches.Polygon([left, top, right, center], color='k')
+    ax.text(
+        s='N',
+        x=minx + xlen * loc_x,
+        y=miny + ylen * (loc_y - pad + height),
+        fontsize=labelsize,
+        horizontalalignment='center',
+        verticalalignment='bottom'
+    )
+    ax.add_patch(triangle)
+
+
+def get_spatial_contribution_percentage(file_path: str | Path, variable_name: str, year_range: list[int, int]) -> xr.DataArray:
+    """
+    计算各格点事件数量占【所有发生过事件的格点】年均总事件数量的百分比
+    """
+    start_year, end_year = year_range
+    n_years = end_year - start_year + 1
+    
     ds = xr.open_dataset(file_path)
-    da = ds['event_flag']
+    da = ds[variable_name].sel(time=slice(f"{start_year}-01-01", f"{end_year}-12-31"))
+
+    # 1. 识别上升沿并计算每个格点的年均发生次数
     mask = da.fillna(0)
     is_start = (mask == 1) & (mask.shift(time=1) != 1)
-    freq = is_start.sum(dim='time') / 21.0
-    return freq
+    grid_annual_freq = is_start.sum(dim='time') / float(n_years) #
+    
+    # 2. 关键修改：分母只对发生过事件的格点求和，剔除零频区域
+    # 这样可以让高频区域的占比显著提升
+    active_grids = grid_annual_freq.where(grid_annual_freq > 0)
+    total_annual_avg = float(active_grids.sum().values) #
+    
+    if total_annual_avg == 0:
+        return grid_annual_freq * 0
+
+    # 3. 计算占比
+    spatial_contribution = (grid_annual_freq / total_annual_avg) * 100
+    
+    return spatial_contribution.astype(np.float32)
+
 
 def plot_frequency(freq_data: xr.DataArray, 
                    output_dir: str, 
@@ -39,216 +82,159 @@ def plot_frequency(freq_data: xr.DataArray,
                    vmax: float, 
                    geo_path: str | Path,
                    cmap: str = 'YlOrRd') -> str | Path:
-    
-    # --- 修复逻辑：鲁棒性读取非标准 GeoJSON，解决 NotImplementedError ---
+    # 与 plot_main.py 保持一致：LambertConformal 投影 + 自定义彩虹色带 + imshow
     use_geopandas = True
     merged = None
     try:
         gdf = gpd.read_file(geo_path)
-        # ensure valid geometry column exists
         try:
             gdf.geometry = gdf.geometry.make_valid()
         except Exception:
             pass
     except Exception:
-        # 回退：手动解析 GeoJSON（避免 geopandas/fiona 的 JSON decode 问题）
         use_geopandas = False
         with open(geo_path, 'r', encoding='utf-8') as f:
             js_data = json.load(f)
         features = js_data['features'] if 'features' in js_data else js_data
-        # 直接构造 shapely 几何列表，然后合并为一个
         shapes = [shape(feat['geometry']) for feat in features]
         merged = unary_union(shapes)
 
-    # 提高插值分辨率
-    freq_data = freq_data.interp(
-        lon=np.arange(freq_data.lon.min(), freq_data.lon.max(), 0.1), 
-        lat=np.arange(freq_data.lat.min(), freq_data.lat.max(), 0.1), 
-        method='linear'
-    )
-    
     if use_geopandas:
         mask = regionmask.mask_3D_geopandas(gdf, freq_data.lon, freq_data.lat)
         freq_masked = freq_data.where(mask.any('region'))
+        boundary_geoms = gdf.geometry
     else:
-        # 使用 shapely geometry + matplotlib.path 在网格上做点内判断，构造掩膜
         lon_vals = freq_data.lon.values
         lat_vals = freq_data.lat.values
         lon2d, lat2d = np.meshgrid(lon_vals, lat_vals)
         pts = np.vstack((lon2d.ravel(), lat2d.ravel())).T
         masks = np.zeros(len(pts), dtype=bool)
-        # merged 可能是多多边形或单多边形
-        if hasattr(merged, 'geoms'):
-            polys = list(merged.geoms)
-        else:
-            polys = [merged]
+        polys = list(merged.geoms) if hasattr(merged, 'geoms') else [merged]
         for p in polys:
             try:
                 path = mpath.Path(np.array(p.exterior.coords))
             except Exception:
-                # 跳过无法处理的子几何
                 continue
             masks |= path.contains_points(pts)
         mask2d = masks.reshape(lon2d.shape)
-        # mask2d 的维度是 (lat, lon)
         mask_da = xr.DataArray(mask2d, dims=('lat', 'lon'), coords={'lat': lat_vals, 'lon': lon_vals})
         freq_masked = freq_data.where(mask_da)
+        boundary_geoms = [merged]
 
-    # --- 关键修复：设置正确的地图比例 ---
-    # 计算中国地图范围的比例，确保地图不被拉伸
-    lon_min, lon_max = 73, 135
-    lat_min, lat_max = 15, 54
-    
-    # 计算经纬度范围的比例
-    lon_range = lon_max - lon_min
-    lat_range = lat_max - lat_min
-    
-    # 根据经纬度范围设置合适的图形宽高比
-    # 注意：PlateCarree投影中，经度纬度的单位长度在赤道处相等，但随纬度变化
-    # 这里使用近似的赤道纬度(约23.5度)的cos值进行修正
-    cos_mid_lat = np.cos(np.radians(23.5))  # 中国大约的中纬度
-    aspect_ratio = (lon_range * cos_mid_lat) / lat_range
-    
-    # 设置图形尺寸，保持正确的比例
-    fig_width = 10
-    fig_height = fig_width / aspect_ratio
-    
-    # 如果高度过大或过小，进行调整
-    if fig_height > 14:
-        fig_height = 14
-        fig_width = fig_height * aspect_ratio
-    elif fig_height < 8:
-        fig_height = 8
-        fig_width = fig_height * aspect_ratio
-    
-    fig = plt.figure(figsize=(fig_width, fig_height))
-    proj = ccrs.PlateCarree()
-    ax = fig.add_subplot(1, 1, 1, projection=proj)
-    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=proj)
-    
-    # 设置坐标轴的长宽比为数据的长宽比，确保1:1比例
-    ax.set_aspect('auto', adjustable='box')
-    
-    levels = np.linspace(vmin, vmax, 21)
-    cf = ax.contourf(
-        freq_masked.lon, freq_masked.lat, freq_masked,
-        levels=levels, transform=proj, cmap=cmap, extend='max'
+    projn = ccrs.LambertConformal(
+        central_longitude=105,
+        central_latitude=40,
+        standard_parallels=(25.0, 47.0)
+    )
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection=projn)
+    ax.set_global()
+
+    lats = freq_masked['lat'].values
+    lons = freq_masked['lon'].values
+    lat_ref = lats[0] - lats[1] if lats.size > 1 else 1.0
+    lon_ref = lons[0] - lons[1] if lons.size > 1 else 1.0
+    extents = [
+        float(np.nanmin(lons) - lon_ref / 2),
+        float(np.nanmax(lons) + lon_ref / 2),
+        float(np.nanmin(lats) - lat_ref / 2),
+        float(np.nanmax(lats) + lat_ref / 2),
+    ]
+    ax.set_extent(extents, crs=ccrs.PlateCarree())
+    ax.add_geometries(boundary_geoms, crs=ccrs.PlateCarree(), facecolor='none', edgecolor='k', linewidth=0.6)
+
+    rainbow_color_list = [
+        '#4E63AC', '#3990BA', '#62BDA7', '#94D4A4', '#C6E89F', '#ECF7A1',
+        '#FFFEBE', '#FEE797', '#FDC574', '#F26944', '#D9444D', '#B11747'
+    ]
+    cmap_select = LinearSegmentedColormap.from_list('custom_cmap', rainbow_color_list)
+    selected_cmap = cmap_select if cmap == 'YlOrRd' else cmap
+
+    show_main = ax.imshow(
+        freq_masked.values[::-1, :],
+        cmap=selected_cmap,
+        transform=ccrs.PlateCarree(),
+        extent=extents,
+        vmin=vmin,
+        vmax=vmax
     )
 
-    # 制作物理裁剪 Patch
-    # 获取用于裁剪与绘制的多边形（可能来自 geopandas 或回退的 merged）
-    if use_geopandas:
-        poly = unary_union(gdf.geometry)
-    else:
-        poly = merged
+    cbar = plt.colorbar(show_main, ax=ax, location='right', pad=0.03, shrink=0.5, aspect=15)
+    cbar.set_label('空间贡献占比 (%)', fontsize=14)
 
-    if hasattr(poly, 'geoms'):
-        subpaths = []
-        for p in poly.geoms:
-            try:
-                subpaths.append(mpath.Path(np.array(p.exterior.coords)))
-            except Exception:
-                continue
-    else:
-        subpaths = [mpath.Path(np.array(poly.exterior.coords))]
-    compound = mpath.Path.make_compound_path(*subpaths)
-    patch = mpatches.PathPatch(compound, transform=ax.transData, facecolor='none')
+    add_north(ax)
 
-    # 裁剪主图（防守式：cf 可能没有 collections 属性）
-    coll_iter = getattr(cf, 'collections', [])
-    for collection in coll_iter:
-        collection.set_clip_path(patch)
-
-    # 地理底图
-    ax.add_feature(cfeature.OCEAN, facecolor='white', zorder=2)
-    ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=3)
-    if use_geopandas:
-        # 使用 geopandas 绘制边界
-        gdf.boundary.plot(ax=ax, linewidth=0.8, color='black', zorder=4, transform=proj)
-    else:
-        from cartopy.feature import ShapelyFeature
-        ax.add_feature(ShapelyFeature([poly], proj, edgecolor='black', facecolor='none', linewidth=0.8), zorder=4)
-
-    # --- 添加南海诸岛缩略图 ---
-    # 调整小图位置和大小，使用 inset_scale 快速放大/缩小（保持简洁，不使用 try/except）
-    inset_scale = 1  # >1 放大, <1 缩小
-    base_left, base_bottom, base_w, base_h = 0.65, 0.129, 0.1, 0.185
-    sub_ax = fig.add_axes([base_left, base_bottom, base_w * inset_scale, base_h * inset_scale], projection=proj)
-    sub_ax.set_extent([107, 122.5, 0, 23.5], crs=proj)
-    # 保持原有的 auto aspect
-    sub_ax.set_aspect('auto', adjustable='box')
-    
-    sub_cf = sub_ax.contourf(
-        freq_masked.lon, freq_masked.lat, freq_masked,
-        levels=levels, transform=proj, cmap=cmap, extend='max'
+    gls = ax.gridlines(
+        draw_labels=True,
+        crs=ccrs.PlateCarree(),
+        color='None',
+        linestyle='dashed',
+        linewidth=0.3,
+        y_inline=False,
+        x_inline=False,
+        rotate_labels=0,
+        xpadding=5,
+        xlocs=range(-180, 180, 10),
+        ylocs=range(-90, 90, 10),
+        xlabel_style={"size": 12, "weight": "bold"},
+        ylabel_style={"size": 12, "weight": "bold"}
     )
-    
-    sub_patch = mpatches.PathPatch(compound, transform=sub_ax.transData, facecolor='none')
-    sub_coll_iter = getattr(sub_cf, 'collections', [])
-    for collection in sub_coll_iter:
-        collection.set_clip_path(sub_patch)
-        
-    sub_ax.add_feature(cfeature.OCEAN, facecolor='white', zorder=2)
-    if use_geopandas:
-        gdf.boundary.plot(ax=sub_ax, linewidth=0.6, color='black', zorder=4, transform=proj)
-    else:
-        from cartopy.feature import ShapelyFeature
-        sub_ax.add_feature(ShapelyFeature([poly], proj, edgecolor='black', facecolor='none', linewidth=0.6), zorder=4)
+    gls.top_labels = False
+    gls.right_labels = False
 
-    # 装饰 (保持中文标题)
-    plt.sca(ax)
-    plt.title(f'年均极端{energy_label}事件发生频率\n({scenario}, 12h阈值, 2040-2060)', fontsize=14)
-    cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.03, aspect=30, shrink=0.7)
-    cbar.set_label('年均发生频率 (次/年)')
+    plt.tight_layout()
+
+    sub_ax = fig.add_axes([0.68, 0.17, 0.12, 0.25], projection=projn)
+    sub_ax.set_extent([104.5, 125, 0, 26], crs=ccrs.PlateCarree())
+    sub_ax.gridlines(
+        draw_labels=False,
+        x_inline=False,
+        y_inline=False,
+        linewidth=0.1,
+        color='none',
+        alpha=0.8,
+        linestyle='--'
+    )
+    sub_ax.add_geometries(boundary_geoms, crs=ccrs.PlateCarree(), facecolor='none', edgecolor='k', linewidth=0.3)
+    sub_ax.imshow(
+        freq_masked.values[::-1, :],
+        cmap=selected_cmap,
+        transform=ccrs.PlateCarree(),
+        extent=extents,
+        vmin=vmin,
+        vmax=vmax
+    )
 
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, f"{energy_label}_{scenario}_Frequency_Map.png")
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"频率图已保存至: {save_path}")
+    # plt.show()
     plt.close()
     return save_path
 
 if __name__ == "__main__":
-    results_root = r"G:\extreme_analysis\results"
-    figure_path_base = "frequency_figures"
-    geo_boundary = r"G:\extreme_analysis\geoshape_file\CHN_ALI\CHN_ALIYUN.geojson"
-    
-    scenarios = ['ssp126', 'ssp245', 'ssp585']
-    energy_types = ['solar', 'wind']
-    energy_types_mapping = {
-        "solar": "rsds",
-        "wind": "ws100m"
-    }
-    
-    cmap_mapping = {
-        'solar': 'YlOrRd',
-        'wind': 'YlGnBu'
-    }
+    geo_boundary = "G:/extreme_analysis/geoshape_file/CHN_ALI/CHN_ALIYUN.geojson"
+    # 输入文件：12h 持续时间判断后的结果
+    fpath = "G:/extreme_analysis/results/Wind/Wind_ssp126_V1_Reliability_12h.nc"
+    year_range = [2040, 2060]
+    variable_name = "event_flag" # duration_judge.py 生成的变量名
 
-    for energy_type in energy_types:
-        print(f"正在处理 {energy_type}...")
-        scenario_data = {}
-        all_max = []
+    # 1. 获取空间贡献比例数据
+    spatial_perc = get_spatial_contribution_percentage(fpath, variable_name, year_range)
 
-        for scenario in scenarios:
-            fpath = os.path.join(results_root, energy_type, f"{energy_type}_{scenario}_V1_Reliability_12h.nc")
-            freq = get_annual_frequency(fpath)
-            if freq is not None:
-                scenario_data[scenario] = freq
-                all_max.append(float(freq.max().values))
-        
-        if not all_max: continue
-        global_vmax = max(all_max)
-        
-        plot_out_dir = os.path.join(results_root, energy_type, figure_path_base)
-        for scenario, da in scenario_data.items():
-            save_path = plot_frequency(
-                freq_data=da, 
-                output_dir=plot_out_dir,
-                energy_label=energy_types_mapping[energy_type],
-                scenario=scenario, 
-                vmin=0, 
-                vmax=global_vmax,
-                geo_path=geo_boundary, 
-                cmap=cmap_mapping.get(energy_type, 'YlOrRd')
-            )
-            print(f"  {energy_type.upper()} {scenario} 完成, 图片保存到 {save_path}")
+    # 2. 设定输出目录
+    fig_output_dir = "G:/extreme_analysis/results/Wind/spatial_contribution_figures"
+    os.makedirs(fig_output_dir, exist_ok=True)
+    
+    # 3. 绘图
+    # 注意：由于单个格点的占比通常很小，vmin/vmax 可能需要根据结果动态调整
+    max_val = float(spatial_perc.max().values)
+    
+    plot_frequency(freq_data=spatial_perc,
+                   output_dir=fig_output_dir,
+                   energy_label="Wind_12h_Spatial_Contribution",
+                   scenario="ssp126",
+                   vmin=0,
+                   vmax=max_val if max_val > 0 else 1, # 动态设置最大值以增强对比度
+                   geo_path=geo_boundary)
