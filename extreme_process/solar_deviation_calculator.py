@@ -106,3 +106,4 @@ def main(hist_path: str=\
 
 if __name__ == "__main__":
     main()
+    # CMIP6_QDM_MME_SolarCF_historical_1deg_utc+8_1h_interpolated_2000-2014.nc
