@@ -14,9 +14,9 @@ logger = logging.getLogger(__name__)
 
 def identify_continuous_events(da_v1, min_steps):
     """
-    识别连续极端时段并按持续时间过滤
+    识别连续极端时段并按持续时间过滤；统计上升沿（0->1）的次数，即事件起点数，作为"发生事件标记"
     da_v1: 0-1 标识的 DataArray (包含 NaN 掩码)
-    min_steps: 最小持续时间步数 (12h=4步, 100h=34步)
+    min_steps: 最小持续时间步数 (12h=12/time_res_hours步, 100h=100/time_res_hours步)
     """
     # 对每个空间格点沿 time 轴应用一个 numpy 1D 函数，计算属于持续 >= min_steps 的位置
     logger.debug(f"开始 identify_continuous_events (apply_ufunc 方式): min_steps={min_steps}; data shape={getattr(da_v1, 'shape', 'unknown')}")
@@ -95,68 +95,74 @@ def identify_continuous_events(da_v1, min_steps):
 
 def main():
     # 路径配置
-    results_dir = r"G:\extreme_analysis\results"
-    scenarios = ["ssp126", "ssp245", "ssp585"]
-    time_res_hours = 3 # 3小时分辨率
+    results_dir = "G:/extreme_analysis/results"
+    time_res_hours = 1 # 1小时分辨率
+    energy_type = "Wind"
+    scenario = "ssp126"
     
     # 阈值定义 (小时 -> 步数)
-    reliability_threshold = int(12 / time_res_hours)    # 4步
-    long_duration_threshold = int(100 / time_res_hours) # 34步
+    reliability_threshold = int(12 / time_res_hours)    # 12步
+    long_duration_threshold = int(100 / time_res_hours) # 100步
 
-    for scn in scenarios:
-        for energy_type in tqdm(["solar", "wind"], desc=f"scn={scn}"):
-            # 动态匹配文件名
-            results_dir_with_energy_type = os.path.join(results_dir, energy_type)
-            prefix = "solar" if energy_type == "solar" else "wind"
-            file_name = f"{prefix}_{scn}_V1_extreme_flag_2040-2060.nc"
-            input_path = os.path.join(results_dir_with_energy_type, file_name)
+    # 单文件处理模式
+    input_path = "G:/extreme_analysis/results/Wind/Wind_ssp126_V1_flag.nc"
 
-            if not os.path.exists(input_path):
-                logger.warning(f"跳过不存在的文件: {input_path}")
-                continue
+    if not os.path.exists(input_path):
+        logger.warning(f"输入文件不存在: {input_path}")
+        return
 
-            logger.info(f"正在处理 {scn} {energy_type} -> {input_path}")
-            file_size = os.path.getsize(input_path)
-            logger.info(f"输入文件大小: {file_size} bytes ({file_size/1024/1024:.2f} MB)")
-            t0 = time.time()
-            try:
-                ds = xr.open_dataset(input_path)
-                if 'is_extreme' not in ds.data_vars:
-                    logger.error(f"文件中未找到 'is_extreme' 变量: {input_path}; 可用变量: {list(ds.data_vars)}")
-                    ds.close()
-                    continue
-                da_v1 = ds['is_extreme']
-                logger.info(f"打开数据集完成: shape={getattr(da_v1,'shape', 'unknown')}; chunks={getattr(da_v1.data, 'chunks', 'unknown')}")
-            except Exception as e:
-                logger.error(f"打开文件失败: {input_path}: {e}")
-                continue
+    logger.info(f"正在处理 {scenario} {energy_type} -> {input_path}")
+    file_size = os.path.getsize(input_path)
+    logger.info(f"输入文件大小: {file_size} bytes ({file_size/1024/1024:.2f} MB)")
+    t0 = time.time()
+    try:
+        ds = xr.open_dataset(input_path)
+        if 'is_extreme' not in ds.data_vars:
+            logger.error(f"文件中未找到 'is_extreme' 变量: {input_path}; 可用变量: {list(ds.data_vars)}")
+            ds.close()
+            return
+        da_v1 = ds['is_extreme']
+        logger.info(f"打开数据集完成: shape={getattr(da_v1,'shape', 'unknown')}; chunks={getattr(da_v1.data, 'chunks', 'unknown')}")
+    except Exception as e:
+        logger.error(f"打开文件失败: {input_path}: {e}")
+        return
+    
+    # 0. 识别 1 h+ 极端事件（即原始事件标记）
+    v1_1h = identify_continuous_events(da_v1, 1)
+    out_1h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_1h.nc")
+    t_1h = time.time()
+    try:
+        v1_1h.to_netcdf(out_1h)
+        logger.info(f"保存完成: {out_1h} (耗时 {time.time()-t_1h:.1f}s)")
+    except Exception as e:
+        logger.error(f"保存失败: {out_1h}: {e}")
 
-            # 1. 识别 12h+ 极端低可靠性事件
-            v1_12h = identify_continuous_events(da_v1, reliability_threshold)
-            out_12h = os.path.join(results_dir, energy_type, f"{energy_type}_{scn}_V1_Reliability_12h.nc")
-            t1 = time.time()
-            try:
-                v1_12h.to_netcdf(out_12h)
-                logger.info(f"保存完成: {out_12h} (耗时 {time.time()-t1:.1f}s)")
-            except Exception as e:
-                logger.error(f"保存失败: {out_12h}: {e}")
+    # 1. 识别 12h+ 极端低可靠性事件
+    v1_12h = identify_continuous_events(da_v1, reliability_threshold)
+    out_12h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_Reliability_12h.nc")
+    t1 = time.time()
+    try:
+        v1_12h.to_netcdf(out_12h)
+        logger.info(f"保存完成: {out_12h} (耗时 {time.time()-t1:.1f}s)")
+    except Exception as e:
+        logger.error(f"保存失败: {out_12h}: {e}")
 
-            # 2. 识别 100h+ 极端长期事件
-            v1_100h = identify_continuous_events(da_v1, long_duration_threshold)
-            out_100h = os.path.join(results_dir, energy_type, f"{energy_type}_{scn}_V1_LongDuration_100h.nc")
-            t2 = time.time()
-            try:
-                v1_100h.to_netcdf(out_100h)
-                logger.info(f"保存完成: {out_100h} (耗时 {time.time()-t2:.1f}s)")
-            except Exception as e:
-                logger.error(f"保存失败: {out_100h}: {e}")
+    # 2. 识别 100h+ 极端长期事件
+    v1_100h = identify_continuous_events(da_v1, long_duration_threshold)
+    out_100h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_LongDuration_100h.nc")
+    t2 = time.time()
+    try:
+        v1_100h.to_netcdf(out_100h)
+        logger.info(f"保存完成: {out_100h} (耗时 {time.time()-t2:.1f}s)")
+    except Exception as e:
+        logger.error(f"保存失败: {out_100h}: {e}")
 
-            # 关闭 dataset
-            try:
-                ds.close()
-            except Exception:
-                pass
-            logger.info(f"处理 {scn} {energy_type} 完成，整个文件处理耗时 {time.time()-t0:.1f}s")
+    # 关闭 dataset
+    try:
+        ds.close()
+    except Exception:
+        pass
+    logger.info(f"处理 {scenario} {energy_type} 完成，整个文件处理耗时 {time.time()-t0:.1f}s")
 
 
 if __name__ == "__main__":

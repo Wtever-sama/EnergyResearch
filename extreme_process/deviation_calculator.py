@@ -75,6 +75,12 @@ class DeviationProcessor:
 
     def get_deviations(self, exp_matrix):
         logger.info("正在计算偏差...")
+        # 兼容期望矩阵维度命名：latitude/longitude -> lat/lon, valid_time -> time
+        exp_dim_map = {'latitude': 'lat', 'longitude': 'lon', 'valid_time': 'time'}
+        exp_rename_map = {k: v for k, v in exp_dim_map.items() if k in exp_matrix.dims or k in exp_matrix.coords}
+        if exp_rename_map:
+            exp_matrix = exp_matrix.rename(exp_rename_map)
+
         # 避免使用 exp_matrix.sel(season=<time-array>, hour=<time-array>) 的高级索引
         # 该写法会触发大规模 int64 广播索引（可达数 GiB），在长时间序列下容易 OOM。
         delta_parts = []
@@ -93,13 +99,28 @@ class DeviationProcessor:
                 if sub_cf.sizes.get('time', 0) == 0:
                     continue
 
-                exp_slice = exp_matrix.sel(season=season, hour=hour)
-                delta_parts.append((sub_cf - exp_slice).rename("delta_x"))
+                exp_slice = exp_matrix.sel(season=season, hour=hour).squeeze(drop=True)
+
+                # 统一到 (lat, lon) 并避免 xarray 自动对齐触发额外广播维度
+                if {'lat', 'lon'}.issubset(exp_slice.dims):
+                    exp_slice = exp_slice.transpose('lat', 'lon')
+                else:
+                    raise ValueError(f"期望切片缺少 lat/lon 维度: dims={exp_slice.dims}")
+
+                # 显式按数组广播： (time, lat, lon) - (lat, lon) -> (time, lat, lon)
+                delta_data = sub_cf.data - exp_slice.data[None, :, :]
+                delta_sub = xr.DataArray(
+                    delta_data,
+                    coords=sub_cf.coords,
+                    dims=sub_cf.dims,
+                    name='delta_x',
+                )
+                delta_parts.append(delta_sub)
 
         if not delta_parts:
             raise ValueError("未生成任何 delta 分块，请检查 time/season/hour 是否匹配。")
 
-        delta = xr.concat(delta_parts, dim='time').sortby('time').rename("delta_x")
+        delta = xr.concat(delta_parts, dim='time').rename("delta_x")
         logger.info(f"偏差计算完成: delta shape (lazy)={getattr(delta, 'shape', 'unknown')}")
         return delta
 
@@ -143,6 +164,13 @@ def get_delta(ssp_paths, variant, exp_path, output_path) -> None:
     except ValueError as e:
         logger.error(f"打开期望矩阵文件失败: {exp_path}: {e}")
         raise
+
+    # 统一期望矩阵维度命名，兼容 (latitude, longitude) / (valid_time, latitude, longitude)
+    exp_dim_map = {'latitude': 'lat', 'longitude': 'lon', 'valid_time': 'time'}
+    exp_rename_map = {k: v for k, v in exp_dim_map.items() if k in exp.dims or k in exp.coords}
+    if exp_rename_map:
+        logger.info(f"期望矩阵维度/坐标重命名: {exp_rename_map}")
+        exp = exp.rename(exp_rename_map)
 
     # 对齐期望矩阵网格，避免坐标不一致导致空间维度被意外裁剪
     if {'lat', 'lon'}.issubset(exp.dims) and {'lat', 'lon'}.issubset(proc.cf.dims):
@@ -206,11 +234,20 @@ def get_delta(ssp_paths, variant, exp_path, output_path) -> None:
                 continue
 
             logger.info(f"时间块 {chunk_start}-{chunk_end} 数据量: time={chunk_nt}")
-            chunk_delta = chunk_proc.get_deviations(exp).sortby('time')
+            chunk_delta = chunk_proc.get_deviations(exp)
 
             # 仅将当前 5 年块加载到内存并写入
-            chunk_delta_np = chunk_delta.load().values.astype(np.float32, copy=False)
-            chunk_times = pd.to_datetime(chunk_delta['time'].values).to_pydatetime()
+            chunk_delta_np = chunk_delta.astype(np.float32).load().values
+            chunk_time_vals = pd.to_datetime(chunk_delta['time'].values)
+
+            # 避免 dask sortby 的 shuffle 开销，改为本地 numpy 排序后写出
+            if chunk_time_vals.size > 1:
+                order = np.argsort(chunk_time_vals.values)
+                if not np.all(order == np.arange(order.size)):
+                    chunk_delta_np = chunk_delta_np[order, :, :]
+                    chunk_time_vals = chunk_time_vals[order]
+
+            chunk_times = chunk_time_vals.to_pydatetime()
             write_end = total_written + chunk_delta_np.shape[0]
 
             time_var[total_written:write_end] = date2num(chunk_times, time_units)
@@ -466,21 +503,21 @@ def get_v1(delta_path, p10_path, output_path) -> None:
 
 
 if __name__ == "__main__":
-    era5_paths = ["G:/extreme_analysis/data/CMIP6_Research_Data/WindCF/era5_WindCF_1deg_china_2000-2009.nc",
-                 "G:/extreme_analysis/data/CMIP6_Research_Data/WindCF/era5_WindCF_1deg_china_2010-2019.nc",
-                 "G:/extreme_analysis/data/CMIP6_Research_Data/WindCF/era5_WindCF_1deg_china_2020-2025.nc"
+    era5_paths = ["G:/extreme_analysis/data/CMIP6_Research_Data/SolarCF/era5_SolarCF_1deg_china_2000-2009.nc",
+                 "G:/extreme_analysis/data/CMIP6_Research_Data/SolarCF/era5_SolarCF_1deg_china_2010-2019.nc",
+                 "G:/extreme_analysis/data/CMIP6_Research_Data/SolarCF/era5_SolarCF_1deg_china_2020-2025.nc"
     ]
-    variant = "Wind"
-    exp_output_path = "G:/extreme_analysis/results/Wind/Wind_ERA5_historical_exp_4x24.nc"
+    variant = "Solar"
+    exp_output_path = "G:/extreme_analysis/results/Solar/Solar_ERA5_historical_exp_4x24.nc"
 
     ssp_paths = [
-        "G:/extreme_analysis/data/CMIP6_Research_Data/WindCF/CMIP6_QDM_MME_WindCF_ssp126_1deg_utc+8_1h_interpolated_2040-2060.nc"
+        "G:/extreme_analysis/data/CMIP6_Research_Data/SolarCF/CMIP6_QDM_MME_SolarCF_ssp585_1deg_utc+8_1h_interpolated_2040-2060.nc"
     ]
-    delta_out_path = "G:/extreme_analysis/results/Wind/Wind_ssp126_V2_delta_x.nc"
+    delta_out_path = "G:/extreme_analysis/results/Solar/Solar_ssp585_V2_delta_x.nc"
     # get_delta(ssp_paths, variant, exp_output_path, delta_out_path)
 
-    p10_output_path = "G:/extreme_analysis/results/Wind/Wind_ssp126_p10_thresholds.nc"
+    p10_output_path = "G:/extreme_analysis/results/Solar/Solar_ssp585_p10_thresholds.nc"
     # get_p10(delta_path=delta_out_path, p10_output_path=p10_output_path)
 
-    v1_output_path = "G:/extreme_analysis/results/Wind/Wind_ssp126_V1_flag.nc"
+    v1_output_path = "G:/extreme_analysis/results/Solar/Solar_ssp585_V1_flag.nc"
     get_v1(delta_path=delta_out_path, p10_path=p10_output_path, output_path=v1_output_path)

@@ -8,12 +8,15 @@ import matplotlib.path as mpath
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib.colors import LinearSegmentedColormap
+from cartopy.mpl.patch import geos_to_path
+from cartopy.io.shapereader import Reader
 import regionmask
 import geopandas as gpd
 from pathlib import Path
 import os
 import json
 from shapely.geometry import shape
+from shapely.geometry import LineString
 from shapely.ops import unary_union
 import warnings
 warnings.filterwarnings("ignore")
@@ -45,10 +48,8 @@ def add_north(ax, labelsize=14, loc_x=0.92, loc_y=0.88, width=0.03, height=0.08,
     ax.add_patch(triangle)
 
 
-def get_spatial_contribution_percentage(file_path: str | Path, variable_name: str, year_range: list[int, int]) -> xr.DataArray:
-    """
-    计算各格点事件数量占【所有发生过事件的格点】年均总事件数量的百分比
-    """
+def get_spatial_frequency_percentage(file_path: str | Path, variable_name: str, year_range: list[int, int]) -> xr.DataArray:
+    """计算各格点年均事件频率占所有格点总年均频率的百分比。"""
     start_year, end_year = year_range
     n_years = end_year - start_year + 1
     
@@ -58,20 +59,23 @@ def get_spatial_contribution_percentage(file_path: str | Path, variable_name: st
     # 1. 识别上升沿并计算每个格点的年均发生次数
     mask = da.fillna(0)
     is_start = (mask == 1) & (mask.shift(time=1) != 1)
-    grid_annual_freq = is_start.sum(dim='time') / float(n_years) #
-    
-    # 2. 关键修改：分母只对发生过事件的格点求和，剔除零频区域
-    # 这样可以让高频区域的占比显著提升
-    active_grids = grid_annual_freq.where(grid_annual_freq > 0)
-    total_annual_avg = float(active_grids.sum().values) #
-    
-    if total_annual_avg == 0:
-        return grid_annual_freq * 0
+    grid_annual_freq = is_start.sum(dim='time') / float(n_years) 
 
-    # 3. 计算占比
-    spatial_contribution = (grid_annual_freq / total_annual_avg) * 100
+    # 2. 计算所有格点的年均事件总频率（步骤1之后，time维已被聚合）
+    annual_frequency = float(grid_annual_freq.sum(skipna=True).values)
+    # print("type(annual_frequency):", type(annual_frequency))
+    # print("annual_frequency:", annual_frequency)
+
+    if annual_frequency == 0:
+        return (grid_annual_freq * 0).astype(np.float32)
+
+    # 3. 计算每个格点年均发生次数占总频率比例（百分比）
+    grid_annual_freq = grid_annual_freq / annual_frequency * 100
+
+    # 4. 反向验证所有格点的频率比例之和是否为 100
+    assert np.isclose(grid_annual_freq.sum(skipna=True).values, 100.0, atol=1e-6), "频率比例之和不为100，可能存在计算错误！"
     
-    return spatial_contribution.astype(np.float32)
+    return grid_annual_freq.astype(np.float32)
 
 
 def plot_frequency(freq_data: xr.DataArray, 
@@ -81,6 +85,7 @@ def plot_frequency(freq_data: xr.DataArray,
                    vmin: float, 
                    vmax: float, 
                    geo_path: str | Path,
+                   province_shp_path: str | Path | None = None,
                    cmap: str = 'YlOrRd') -> str | Path:
     # 与 plot_main.py 保持一致：LambertConformal 投影 + 自定义彩虹色带 + imshow
     use_geopandas = True
@@ -99,10 +104,33 @@ def plot_frequency(freq_data: xr.DataArray,
         shapes = [shape(feat['geometry']) for feat in features]
         merged = unary_union(shapes)
 
+    # 可选：读取省级边界（类比 plot_main.py 的 shp_filelist 叠加边界）
+    province_geoms = None
+    if province_shp_path is not None:
+        province_path = Path(province_shp_path)
+        # 若传入的是国家级 gadm41_CHN_0.shp，优先尝试同目录下的省级 gadm41_CHN_1.shp
+        if province_path.name.endswith('_0.shp'):
+            level1_candidate = province_path.with_name(province_path.name.replace('_0.shp', '_1.shp'))
+            if level1_candidate.exists():
+                print(f"检测到省级边界文件，优先使用: {level1_candidate}")
+                province_path = level1_candidate
+            else:
+                print("提示: 当前传入为国家级 _0.shp；若需省级边界，请提供 _1.shp。")
+
+        if province_path.exists():
+            try:
+                # 与 plot_main.py 一致，直接用 Reader 读取 shp 几何，规避 geopandas/shapely 兼容问题
+                province_geoms = list(Reader(str(province_path)).geometries())
+            except Exception as e:
+                print(f"省级边界读取失败，将跳过省界绘制: {province_path}; error={e}")
+        else:
+            print(f"省级边界文件不存在，将跳过省界绘制: {province_path}")
+
     if use_geopandas:
         mask = regionmask.mask_3D_geopandas(gdf, freq_data.lon, freq_data.lat)
         freq_masked = freq_data.where(mask.any('region'))
         boundary_geoms = gdf.geometry
+        china_geom = unary_union(gdf.geometry)
     else:
         lon_vals = freq_data.lon.values
         lat_vals = freq_data.lat.values
@@ -120,6 +148,7 @@ def plot_frequency(freq_data: xr.DataArray,
         mask_da = xr.DataArray(mask2d, dims=('lat', 'lon'), coords={'lat': lat_vals, 'lon': lon_vals})
         freq_masked = freq_data.where(mask_da)
         boundary_geoms = [merged]
+        china_geom = merged
 
     projn = ccrs.LambertConformal(
         central_longitude=105,
@@ -132,8 +161,14 @@ def plot_frequency(freq_data: xr.DataArray,
 
     lats = freq_masked['lat'].values
     lons = freq_masked['lon'].values
-    lat_ref = lats[0] - lats[1] if lats.size > 1 else 1.0
-    lon_ref = lons[0] - lons[1] if lons.size > 1 else 1.0
+
+    # 用坐标差分的绝对值估计网格分辨率，避免坐标升序/降序引起的负步长错位
+    lat_ref = float(np.nanmedian(np.abs(np.diff(lats)))) if lats.size > 1 else 1.0
+    lon_ref = float(np.nanmedian(np.abs(np.diff(lons)))) if lons.size > 1 else 1.0
+    print(f"检测到网格分辨率: lat_ref={lat_ref:.4f}°, lon_ref={lon_ref:.4f}°")
+    if not np.isclose(lat_ref, 1.0, atol=1e-6) or not np.isclose(lon_ref, 1.0, atol=1e-6):
+        print("提示: 当前网格分辨率不是严格1°，将按检测到的分辨率自动设置 extent。")
+
     extents = [
         float(np.nanmin(lons) - lon_ref / 2),
         float(np.nanmax(lons) + lon_ref / 2),
@@ -141,7 +176,9 @@ def plot_frequency(freq_data: xr.DataArray,
         float(np.nanmax(lats) + lat_ref / 2),
     ]
     ax.set_extent(extents, crs=ccrs.PlateCarree())
-    ax.add_geometries(boundary_geoms, crs=ccrs.PlateCarree(), facecolor='none', edgecolor='k', linewidth=0.6)
+    ax.add_geometries(boundary_geoms, crs=ccrs.PlateCarree(), facecolor='none', edgecolor='k', linewidth=0.6, zorder=20)
+    if province_geoms is not None and len(province_geoms) > 0:
+        ax.add_geometries(province_geoms, crs=ccrs.PlateCarree(), facecolor='none', edgecolor='k', linewidth=0.35, zorder=21)
 
     rainbow_color_list = [
         '#4E63AC', '#3990BA', '#62BDA7', '#94D4A4', '#C6E89F', '#ECF7A1',
@@ -156,31 +193,95 @@ def plot_frequency(freq_data: xr.DataArray,
         transform=ccrs.PlateCarree(),
         extent=extents,
         vmin=vmin,
-        vmax=vmax
+        vmax=vmax,
+        zorder=2
     )
-
-    cbar = plt.colorbar(show_main, ax=ax, location='right', pad=0.03, shrink=0.5, aspect=15)
-    cbar.set_label('空间贡献占比 (%)', fontsize=14)
-
-    add_north(ax)
 
     gls = ax.gridlines(
         draw_labels=True,
         crs=ccrs.PlateCarree(),
-        color='None',
+        color='gray',
         linestyle='dashed',
         linewidth=0.3,
+        alpha=0.5,
+        zorder=0,
         y_inline=False,
         x_inline=False,
         rotate_labels=0,
         xpadding=5,
-        xlocs=range(-180, 180, 10),
-        ylocs=range(-90, 90, 10),
+        xlocs=np.arange(70, 140, 10),
+        ylocs=np.arange(10, 60, 10),
         xlabel_style={"size": 12, "weight": "bold"},
         ylabel_style={"size": 12, "weight": "bold"}
     )
+    if hasattr(gls, 'xlines'):
+        gls.xlines = False
+    if hasattr(gls, 'ylines'):
+        gls.ylines = False
     gls.top_labels = False
     gls.right_labels = False
+
+    # 仅在国界外绘制经纬线，避免覆盖中国国界内区域
+    lon_min, lon_max, lat_min, lat_max = extents
+    x_ticks = np.arange(70, 140, 10)
+    y_ticks = np.arange(10, 60, 10)
+
+    def _plot_outside_parts(geom_obj):
+        if geom_obj is None or geom_obj.is_empty:
+            return
+        if geom_obj.geom_type == 'LineString':
+            xy = np.asarray(geom_obj.coords)
+            if xy.shape[0] >= 2:
+                ax.plot(
+                    xy[:, 0],
+                    xy[:, 1],
+                    transform=ccrs.PlateCarree(),
+                    color='gray',
+                    linestyle='dashed',
+                    linewidth=0.3,
+                    alpha=0.5,
+                    zorder=0,
+                )
+            return
+        for sub_geom in getattr(geom_obj, 'geoms', []):
+            _plot_outside_parts(sub_geom)
+
+    # 使用高密度采样构造经纬线，避免投影后出现明显折线/断裂感
+    sample_n = 721
+    lat_samples = np.linspace(float(lat_min), float(lat_max), sample_n)
+    lon_samples = np.linspace(float(lon_min), float(lon_max), sample_n)
+
+    for x_tick in x_ticks:
+        meridian_xy = np.column_stack([np.full(sample_n, float(x_tick)), lat_samples])
+        full_meridian = LineString(meridian_xy)
+        outside_meridian = full_meridian.difference(china_geom)
+        _plot_outside_parts(outside_meridian)
+
+    for y_tick in y_ticks:
+        parallel_xy = np.column_stack([lon_samples, np.full(sample_n, float(y_tick))])
+        full_parallel = LineString(parallel_xy)
+        outside_parallel = full_parallel.difference(china_geom)
+        _plot_outside_parts(outside_parallel)
+
+    # 与 draw_china_grid_v2 对齐：构造几何裁剪路径，确保图像严格落在中国边界内
+    clip_paths = geos_to_path(china_geom)
+    if clip_paths:
+        combined_path = mpath.Path.make_compound_path(*clip_paths)
+        main_clip_patch = mpatches.PathPatch(
+            combined_path,
+            transform=ccrs.PlateCarree(),
+            facecolor='none',
+            edgecolor='none',
+            linewidth=0,
+            antialiased=False
+        )
+        ax.add_patch(main_clip_patch)
+        show_main.set_clip_path(main_clip_patch)
+
+    cbar = plt.colorbar(show_main, ax=ax, location='right', pad=0.03, shrink=0.5, aspect=15)
+    cbar.set_label('空间贡献率 (%)', fontsize=14)
+
+    add_north(ax)
 
     plt.tight_layout()
 
@@ -196,7 +297,9 @@ def plot_frequency(freq_data: xr.DataArray,
         linestyle='--'
     )
     sub_ax.add_geometries(boundary_geoms, crs=ccrs.PlateCarree(), facecolor='none', edgecolor='k', linewidth=0.3)
-    sub_ax.imshow(
+    if province_geoms is not None and len(province_geoms) > 0:
+        sub_ax.add_geometries(province_geoms, crs=ccrs.PlateCarree(), facecolor='none', edgecolor='k', linewidth=0.2)
+    show_sub = sub_ax.imshow(
         freq_masked.values[::-1, :],
         cmap=selected_cmap,
         transform=ccrs.PlateCarree(),
@@ -204,6 +307,18 @@ def plot_frequency(freq_data: xr.DataArray,
         vmin=vmin,
         vmax=vmax
     )
+
+    if clip_paths:
+        sub_clip_patch = mpatches.PathPatch(
+            combined_path,
+            transform=ccrs.PlateCarree(),
+            facecolor='none',
+            edgecolor='none',
+            linewidth=0,
+            antialiased=False
+        )
+        sub_ax.add_patch(sub_clip_patch)
+        show_sub.set_clip_path(sub_clip_patch)
 
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, f"{energy_label}_{scenario}_Frequency_Map.png")
@@ -215,26 +330,27 @@ def plot_frequency(freq_data: xr.DataArray,
 
 if __name__ == "__main__":
     geo_boundary = "G:/extreme_analysis/geoshape_file/CHN_ALI/CHN_ALIYUN.geojson"
+    province_boundary = "G:/extreme_analysis/geoshape_file/gadm41_CHN_shp/gadm41_CHN_0.shp"
     # 输入文件：12h 持续时间判断后的结果
-    fpath = "G:/extreme_analysis/results/Wind/Wind_ssp126_V1_Reliability_12h.nc"
+    fpath = "G:/extreme_analysis/results/Wind/Wind_ssp126_V1_1h.nc"
     year_range = [2040, 2060]
     variable_name = "event_flag" # duration_judge.py 生成的变量名
 
-    # 1. 获取空间贡献比例数据
-    spatial_perc = get_spatial_contribution_percentage(fpath, variable_name, year_range)
+    # 1. 获取年均事件频率数据
+    spatial_freq = get_spatial_frequency_percentage(fpath, variable_name, year_range)
 
     # 2. 设定输出目录
     fig_output_dir = "G:/extreme_analysis/results/Wind/spatial_contribution_figures"
     os.makedirs(fig_output_dir, exist_ok=True)
     
     # 3. 绘图
-    # 注意：由于单个格点的占比通常很小，vmin/vmax 可能需要根据结果动态调整
-    max_val = float(spatial_perc.max().values)
+    max_val = float(spatial_freq.max().values)
     
-    plot_frequency(freq_data=spatial_perc,
+    plot_frequency(freq_data=spatial_freq,
                    output_dir=fig_output_dir,
-                   energy_label="Wind_12h_Spatial_Contribution",
+                   energy_label="Wind_Spatial_Contribution",
                    scenario="ssp126",
                    vmin=0,
-                   vmax=max_val if max_val > 0 else 1, # 动态设置最大值以增强对比度
-                   geo_path=geo_boundary)
+                   vmax=max_val if max_val > 0 else 1,
+                   geo_path=geo_boundary,
+                   province_shp_path=province_boundary)

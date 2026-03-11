@@ -341,8 +341,7 @@ def inspect_npy_file(file_path, log_dir="logs"):
 
 if __name__ == "__main__":
     # data_name = r"G:\extreme_analysis\data\CMIP6_QDM_MME\*.nc"
-    data_name = r"G:\extreme_analysis\results\Wind\*.nc"
+    data_name = r"F:\code_program\EnergyResearch\extreme_process\STICC\STICC-master\output_folder\*.npy"
     files = glob.glob(pathname=data_name)
     for f in files:
-        inspect_nc_file(f)
-        # inspect_npy_file(f)
+        inspect_npy_file(f)

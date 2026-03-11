@@ -1,10 +1,11 @@
 """
 data_reader.py
 
-快速读取 NetCDF (.nc) 文件并在控制台打印每个文件的前 20 行描述（方便快速检查文件头）。
+快速读取 NetCDF (.nc) / NumPy (.npy) 文件并在控制台打印摘要（方便快速检查文件头）。
 
 用法示例 (PowerShell):
 python f:\code_program\EnergyResearch\extreme_process\data_reader.py --pattern "G:\extreme_analysis\data\CMIP6_Research_Data\*.nc"
+python f:\code_program\EnergyResearch\extreme_process\data_reader.py --pattern "G:\extreme_analysis\data\CMIP6_Research_Data\*.npy"
 
 如果不提供 --pattern，脚本将在当前目录查找 "*.nc" 文件。
 """
@@ -219,9 +220,82 @@ def print_nc_head(file_path: str, n_lines: int = 20):
         logger.error(f"无法读取文件 {file_path}: {e}")
 
 
+def print_npy_head(file_path: str, n_lines: int = 20):
+    """读取一个 NPY 文件并打印数组摘要与样本值。"""
+    try:
+        arr = np.load(file_path, allow_pickle=True)
+
+        print(f"\n--- {os.path.basename(file_path)} ---")
+        print(f"type: {type(arr)}")
+
+        # 常规 ndarray
+        if isinstance(arr, np.ndarray):
+            print(f"shape: {arr.shape}")
+            print(f"dtype: {arr.dtype}")
+            print(f"ndim: {arr.ndim}")
+            print(f"size: {arr.size}")
+
+            # object 数组可能包含字典等复杂对象
+            if arr.dtype == object:
+                flat_obj = arr.ravel()
+                show_n = min(n_lines, flat_obj.size)
+                print(f"object array sample (first {show_n}):")
+                for i in range(show_n):
+                    print(f"  [{i}] {repr(flat_obj[i])}")
+                return
+
+            # 数值数组统计
+            if np.issubdtype(arr.dtype, np.number) or np.issubdtype(arr.dtype, np.bool_):
+                finite_arr = arr.astype(np.float64, copy=False)
+                print(f"mean: {float(np.nanmean(finite_arr))}")
+                print(f"min: {float(np.nanmin(finite_arr))}")
+                print(f"max: {float(np.nanmax(finite_arr))}")
+                print(f"std: {float(np.nanstd(finite_arr))}")
+
+                if arr.size > 0:
+                    missing = int(np.count_nonzero(np.isnan(finite_arr)))
+                    miss_prop = missing / arr.size
+                    print(f"missing (NaN) count: {missing}")
+                    print(f"missing proportion: {miss_prop:.4f} ({miss_prop*100:.2f}%)")
+
+            # 打印首尾样本（最多 n_lines 个）
+            flat = arr.ravel()
+            show_n = min(n_lines, flat.size)
+            head_vals = flat[:show_n].tolist()
+            tail_vals = flat[-show_n:].tolist() if flat.size > 0 else []
+            print(f"head sample (first {show_n}): {head_vals}")
+            print(f"tail sample (last {show_n}): {tail_vals}")
+            return
+
+        # 其他类型兜底输出
+        print(repr(arr))
+    except Exception as e:
+        logger.error(f"无法读取文件 {file_path}: {e}")
+
+
+def check_sticc_txt(file_path: str):
+    import pandas as pd
+
+    # 读取生成的 txt 文件（因为没有表头，所以 header=None）
+    df = pd.read_csv(file_path, header=None)
+
+    print(f"总列数: {df.shape[1]}")
+
+    # 1. 检查第0列是否为 ID (应该是从 0 开始的整数)
+    print("前5行的 ID (第0列):", df.iloc[:5, 0].values)
+
+    # 2. 检查属性列 (例如第100列，应该是一个浮点数，即 SolarCF 值)
+    print("前5行的属性值 (第100列):", df.iloc[:5, 100].values)
+
+    # 3. 检查邻居列（比如第1001列，这应该是一个代表邻居网格点的整数 ID）
+    # 注意：如果这里输出的是浮点数，说明你设置的 start 偏小了，读到了属性列里
+    print("前5行的邻居索引 (第1000列):", df.iloc[:5, 1000].values)
+    print("前5行的邻居索引 (第1001列):", df.iloc[:5, 1001].values)
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Print first N lines of NetCDF file description (xarray repr).')
-    parser.add_argument('--pattern', '-p', default='*.nc', help='文件匹配模式或单个文件路径 (默认: *.nc)')
+    parser = argparse.ArgumentParser(description='Print summary for NetCDF(.nc) and NumPy(.npy) files.')
+    parser.add_argument('--pattern', '-p', default='*.nc', help='文件匹配模式或单个文件路径 (示例: *.nc, *.npy)')
     parser.add_argument('--lines', '-n', type=int, default=20, help='要打印的行数 (默认: 20)')
 
     args = parser.parse_args()
@@ -238,8 +312,19 @@ def main():
         logger.warning(f"未找到匹配文件: {pattern}")
         return
 
+    supported_ext = {'.nc', '.npy', '.txt'}
     for f in files:
-        print_nc_head(f, n_lines=args.lines)
+        ext = os.path.splitext(f)[1].lower()
+        if ext not in supported_ext:
+            logger.warning(f"跳过不支持的文件类型: {f}")
+            continue
+
+        if ext == '.nc':
+            print_nc_head(f, n_lines=args.lines)
+        elif ext == '.npy':
+            print_npy_head(f, n_lines=args.lines)
+        elif ext == '.txt':
+            check_sticc_txt(f)  # "G:\extreme_analysis\sticc_dataset\ssp126\SolarCF\sticc_final_input.txt"
 
 
 if __name__ == '__main__':
