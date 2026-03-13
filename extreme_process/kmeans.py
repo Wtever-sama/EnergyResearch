@@ -1,3 +1,5 @@
+''' 聚类的依据是容量因子在整个时间跨度上受灾模式的相似性 '''
+
 import xarray as xr
 import numpy as np
 import pandas as pd

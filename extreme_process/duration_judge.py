@@ -101,11 +101,11 @@ def main():
     scenario = "ssp585"
     
     # 阈值定义 (小时 -> 步数)
-    reliability_threshold = int(3 / time_res_hours)    # 3步
+    reliability_threshold = int(6 / time_res_hours)    # 6步
     long_duration_threshold = int(100 / time_res_hours) # 100步
 
     # 单文件处理模式
-    input_path = "G:/extreme_analysis/results/Solar/Solar_{}_V1_flag.nc".format(scenario)
+    input_path = "G:/extreme_analysis/results/{0}/Solar_{1}_V1_flag.nc".format(energy_type, scenario)
 
     if not os.path.exists(input_path):
         logger.warning(f"输入文件不存在: {input_path}")
@@ -128,24 +128,24 @@ def main():
         return
     
     # 0. 识别 1 h+ 极端事件（即原始事件标记）
-    # v1_1h = identify_continuous_events(da_v1, 1)
-    # out_1h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_1h.nc")
-    # t_1h = time.time()
-    # try:
-    #     v1_1h.to_netcdf(out_1h)
-    #     logger.info(f"保存完成: {out_1h} (耗时 {time.time()-t_1h:.1f}s)")
-    # except Exception as e:
-    #     logger.error(f"保存失败: {out_1h}: {e}")
+    v1_1h = identify_continuous_events(da_v1, 1)
+    out_1h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_1h.nc")
+    t_1h = time.time()
+    try:
+        v1_1h.to_netcdf(out_1h)
+        logger.info(f"保存完成: {out_1h} (耗时 {time.time()-t_1h:.1f}s)")
+    except Exception as e:
+        logger.error(f"保存失败: {out_1h}: {e}")
 
-    # 1. 识别 3h+ 极端低可靠性事件
-    v1_3h = identify_continuous_events(da_v1, reliability_threshold)
-    out_3h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_Reliability_3h.nc")
+    # 1. 识别 6h+ 极端低可靠性事件
+    v1_6h = identify_continuous_events(da_v1, reliability_threshold)
+    out_6h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_Reliability_6h.nc")
     t1 = time.time()
     try:
-        v1_3h.to_netcdf(out_3h)
-        logger.info(f"保存完成: {out_3h} (耗时 {time.time()-t1:.1f}s)")
+        v1_6h.to_netcdf(out_6h)
+        logger.info(f"保存完成: {out_6h} (耗时 {time.time()-t1:.1f}s)")
     except Exception as e:
-        logger.error(f"保存失败: {out_3h}: {e}")
+        logger.error(f"保存失败: {out_6h}: {e}")
 
     # 2. 识别 100h+ 极端长期事件
     # v1_100h = identify_continuous_events(da_v1, long_duration_threshold)
