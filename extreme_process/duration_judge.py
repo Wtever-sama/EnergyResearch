@@ -97,15 +97,15 @@ def main():
     # 路径配置
     results_dir = "G:/extreme_analysis/results"
     time_res_hours = 1 # 1小时分辨率
-    energy_type = "Wind"
-    scenario = "ssp126"
+    energy_type = "Solar"
+    scenario = "ssp585"
     
     # 阈值定义 (小时 -> 步数)
-    reliability_threshold = int(12 / time_res_hours)    # 12步
+    reliability_threshold = int(3 / time_res_hours)    # 3步
     long_duration_threshold = int(100 / time_res_hours) # 100步
 
     # 单文件处理模式
-    input_path = "G:/extreme_analysis/results/Wind/Wind_ssp126_V1_flag.nc"
+    input_path = "G:/extreme_analysis/results/Solar/Solar_{}_V1_flag.nc".format(scenario)
 
     if not os.path.exists(input_path):
         logger.warning(f"输入文件不存在: {input_path}")
@@ -128,34 +128,34 @@ def main():
         return
     
     # 0. 识别 1 h+ 极端事件（即原始事件标记）
-    v1_1h = identify_continuous_events(da_v1, 1)
-    out_1h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_1h.nc")
-    t_1h = time.time()
-    try:
-        v1_1h.to_netcdf(out_1h)
-        logger.info(f"保存完成: {out_1h} (耗时 {time.time()-t_1h:.1f}s)")
-    except Exception as e:
-        logger.error(f"保存失败: {out_1h}: {e}")
+    # v1_1h = identify_continuous_events(da_v1, 1)
+    # out_1h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_1h.nc")
+    # t_1h = time.time()
+    # try:
+    #     v1_1h.to_netcdf(out_1h)
+    #     logger.info(f"保存完成: {out_1h} (耗时 {time.time()-t_1h:.1f}s)")
+    # except Exception as e:
+    #     logger.error(f"保存失败: {out_1h}: {e}")
 
-    # 1. 识别 12h+ 极端低可靠性事件
-    v1_12h = identify_continuous_events(da_v1, reliability_threshold)
-    out_12h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_Reliability_12h.nc")
+    # 1. 识别 3h+ 极端低可靠性事件
+    v1_3h = identify_continuous_events(da_v1, reliability_threshold)
+    out_3h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_Reliability_3h.nc")
     t1 = time.time()
     try:
-        v1_12h.to_netcdf(out_12h)
-        logger.info(f"保存完成: {out_12h} (耗时 {time.time()-t1:.1f}s)")
+        v1_3h.to_netcdf(out_3h)
+        logger.info(f"保存完成: {out_3h} (耗时 {time.time()-t1:.1f}s)")
     except Exception as e:
-        logger.error(f"保存失败: {out_12h}: {e}")
+        logger.error(f"保存失败: {out_3h}: {e}")
 
     # 2. 识别 100h+ 极端长期事件
-    v1_100h = identify_continuous_events(da_v1, long_duration_threshold)
-    out_100h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_LongDuration_100h.nc")
-    t2 = time.time()
-    try:
-        v1_100h.to_netcdf(out_100h)
-        logger.info(f"保存完成: {out_100h} (耗时 {time.time()-t2:.1f}s)")
-    except Exception as e:
-        logger.error(f"保存失败: {out_100h}: {e}")
+    # v1_100h = identify_continuous_events(da_v1, long_duration_threshold)
+    # out_100h = os.path.join(results_dir, energy_type, f"{energy_type}_{scenario}_V1_LongDuration_100h.nc")
+    # t2 = time.time()
+    # try:
+    #     v1_100h.to_netcdf(out_100h)
+    #     logger.info(f"保存完成: {out_100h} (耗时 {time.time()-t2:.1f}s)")
+    # except Exception as e:
+    #     logger.error(f"保存失败: {out_100h}: {e}")
 
     # 关闭 dataset
     try:
