@@ -67,7 +67,6 @@ def get_composite_v1(solar_v1_path, wind_v1_path, output_path):
 
 
 if __name__ == "__main__":
-    # 填入你的文件路径
     solar_path = "G:/extreme_analysis/results/Solar/Solar_ssp585_V1_flag.nc"
     wind_path = "G:/extreme_analysis/results/Wind/Wind_ssp585_V1_flag.nc"
     comp_out_path = "G:/extreme_analysis/results/Composite/Solar_Wind_ssp585_V1_flag.nc"

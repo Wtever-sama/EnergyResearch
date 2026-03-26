@@ -275,12 +275,13 @@ def plot_frequency(freq_data: xr.DataArray,
         show_main.set_clip_path(main_clip_patch)
 
     cbar = plt.colorbar(show_main, ax=ax, location='right', pad=0.03, shrink=0.5, aspect=15)
-    cbar.set_label('空间贡献率 (%)', fontsize=14)
+    cbar.set_label('空间分布比例 (%)', fontsize=14)
 
     add_north(ax)
 
     plt.tight_layout()
 
+    # 南海诸岛小地图
     sub_ax = fig.add_axes([0.66, 0.19, 0.12, 0.25], projection=projn)
     sub_ax.set_extent([104.5, 125, 0, 26], crs=ccrs.PlateCarree())
     sub_ax.gridlines(
@@ -340,7 +341,7 @@ if __name__ == "__main__":
     spatial_freq = get_spatial_frequency_percentage(fpath, variable_name, year_range)
 
     # 2. 设定输出目录
-    fig_output_dir = "G:/extreme_analysis/results/Wind/spatial_contribution_figures"
+    fig_output_dir = "G:/extreme_analysis/results/Wind/spatial_frequency"
     os.makedirs(fig_output_dir, exist_ok=True)
     
     # 3. 绘图
